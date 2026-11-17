@@ -1,0 +1,236 @@
+%matplotlib inline
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+import random
+import tensorflow as tf
+np.random.seed(42)
+tf.random.set_seed(42)
+random.seed(42)
+
+# Load dataset
+dataset_path = 'tomato_retail_sales_daily_2009_2022 (1).csv'
+df = pd.read_csv(dataset_path)
+
+# Display dataset info
+display(df.head())
+print(f"Dataset Shape: {df.shape}")
+
+
+# Parse dates and check date range
+df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y')
+print(f"Date Range: {df['Date'].min().date()} to {df['Date'].max().date()}")
+
+# Check for missing values
+print("\nMissing Values:")
+print(df.isnull().sum())
+
+# Plot historical demand over time
+plt.figure(figsize=(15, 5))
+plt.plot(df['Date'], df['Quantity Sold (kg)'], color='green', alpha=0.6)
+plt.title('Daily Tomato Demand Over Time (2009 - 2022)')
+plt.xlabel('Date')
+plt.ylabel('Quantity Sold (kg)')
+plt.grid(True, alpha=0.3)
+# plt.show()
+
+
+# --- STEP: DATA SCALING ---
+# LSTMs are sensitive to the scale of input data. We scale demand to [0, 1].
+# 1. Sort strictly by date
+df = df.sort_values('Date').reset_index(drop=True)
+
+# 2. Select target
+target_col = 'Quantity Sold (kg)'
+data = df[['Date', target_col]].copy()
+
+# 3. Chronological Split
+train_df = data[(data['Date'].dt.year >= 2009) & (data['Date'].dt.year <= 2018)]
+val_df   = data[(data['Date'].dt.year >= 2019) & (data['Date'].dt.year <= 2020)]
+test_df  = data[(data['Date'].dt.year >= 2021) & (data['Date'].dt.year <= 2022)]
+
+print(f"Train samples: {len(train_df)}")
+print(f"Val samples: {len(val_df)}")
+print(f"Test samples: {len(test_df)}")
+
+# 4. Scaling (LSTMs require scaled data for stable gradients)
+from sklearn.preprocessing import MinMaxScaler
+scaler = MinMaxScaler(feature_range=(0, 1))
+
+# Fit ONLY on training data to prevent leakage!
+train_scaled = scaler.fit_transform(train_df[[target_col]])
+val_scaled   = scaler.transform(val_df[[target_col]])
+test_scaled  = scaler.transform(test_df[[target_col]])
+
+# Extract raw targets for evaluation later
+actual_test_demand = test_df[target_col].values
+
+
+# Shift test data by 1 day to simulate "predicting tomorrow using today"
+naive_forecast = test_df[target_col].shift(1).copy()
+naive_forecast.iloc[0] = val_df[target_col].iloc[-1] # Fill the first day with the last val day
+naive_forecast = naive_forecast.values
+
+
+# Create a 7-day moving average
+# We prepend the last 7 days of validation data to calculate the first 7 days of test data properly
+history = pd.concat([val_df[target_col].iloc[-7:], test_df[target_col]])
+moving_avg_forecast = history.rolling(window=7).mean().shift(1).dropna().values
+
+
+# --- STEP: SEQUENCE GENERATION ---
+# We convert 1D time-series data into 3D sequences (Samples, Timesteps, Features) for the LSTM.
+LOOKBACK = 30
+
+def create_sequences(data_array, lookback):
+    X, y = [], []
+    for i in range(len(data_array) - lookback):
+        X.append(data_array[i : i + lookback, 0])
+        y.append(data_array[i + lookback, 0])
+    return np.array(X), np.array(y)
+
+X_train, y_train = create_sequences(train_scaled, LOOKBACK)
+X_val, y_val     = create_sequences(val_scaled, LOOKBACK)
+X_test, y_test   = create_sequences(test_scaled, LOOKBACK)
+
+# Reshape to 3D: (samples, timesteps, features)
+X_train = np.reshape(X_train, (X_train.shape[0], X_train.shape[1], 1))
+X_val   = np.reshape(X_val, (X_val.shape[0], X_val.shape[1], 1))
+X_test  = np.reshape(X_test, (X_test.shape[0], X_test.shape[1], 1))
+
+print(f"X_train shape: {X_train.shape} (Samples, Timesteps, Features)")
+print(f"y_train shape: {y_train.shape}")
+
+
+
+# --- STEP: BUILD STANDARD LSTM ---
+# This model processes the sequence sequentially without explicit attention weighting.
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+lstm_model = Sequential([
+    Input(shape=(LOOKBACK, 1)),
+    LSTM(64, activation='tanh'),
+    Dense(32, activation='relu'),
+    Dense(1)
+])
+
+lstm_model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+lstm_model.summary()
+
+
+# --- STEP: BUILD LSTM + ATTENTION ---
+# The CustomAttention layer computes a weighted sum of the LSTM's hidden states,
+# allowing the model to focus on the most important historical days.
+from tensorflow.keras.layers import Layer
+import tensorflow.keras.backend as K
+
+class CustomAttention(Layer):
+    def __init__(self, **kwargs):
+        super(CustomAttention, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        # Weight matrix for the attention mechanism
+        self.W = self.add_weight(name='attention_weight', 
+                                 shape=(input_shape[-1], 1),
+                                 initializer='random_normal',
+                                 trainable=True)
+        self.b = self.add_weight(name='attention_bias',
+                                 shape=(input_shape[1], 1),
+                                 initializer='zeros',
+                                 trainable=True)
+        super(CustomAttention, self).build(input_shape)
+
+    def call(self, x):
+        # x is the sequence of hidden states from LSTM
+        e = K.tanh(K.dot(x, self.W) + self.b)
+        a = K.softmax(e, axis=1) # Attention weights
+        output = x * a
+        return K.sum(output, axis=1) # Weighted sum of hidden states
+
+inputs = Input(shape=(LOOKBACK, 1))
+x = LSTM(64, return_sequences=True, activation='tanh')(inputs) # return_sequences=True is required for Attention
+x = CustomAttention()(x)
+x = Dense(32, activation='relu')(x)
+outputs = Dense(1)(x)
+
+attention_model = Model(inputs=inputs, outputs=outputs)
+attention_model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+attention_model.summary()
+
+
+# --- STEP: MODEL TRAINING ---
+# We train both models using Early Stopping to halt training when validation loss stops improving.
+EPOCHS = 30 # Kept reasonably low for demonstration
+BATCH_SIZE = 32
+
+early_stop = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+
+print("Training Standard LSTM...")
+history_lstm = lstm_model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+)
+print("Standard LSTM trained.")
+
+
+# --- EVALUATE LSTM ---
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import numpy as np
+
+# 1. Make predictions
+predictions_scaled = lstm_model.predict(X_test, verbose=0)
+
+# 2. Convert predictions back to kg
+predictions = scaler.inverse_transform(predictions_scaled).flatten()
+
+# 3. Get actual values
+actual = actual_test_demand[LOOKBACK:]
+
+# 4. Calculate errors
+mae = mean_absolute_error(actual, predictions)
+rmse = np.sqrt(mean_squared_error(actual, predictions))
+
+# 5. Display results
+print(f"MAE:  {mae:.2f} kg")
+print(f"RMSE: {rmse:.2f} kg")
+
+plt.figure(figsize=(15, 6))
+
+# Plotting the first 100 days of the test set predictions for visual clarity
+PLOT_DAYS = 100
+
+plt.plot(aligned_actuals[:PLOT_DAYS], label='Actual Demand (kg)', color='black', linewidth=2)
+plt.plot(aligned_naive[:PLOT_DAYS], label='Naive Baseline', color='grey', linestyle='--', alpha=0.7)
+plt.plot(lstm_preds[:PLOT_DAYS], label='Standard LSTM', color='blue', alpha=0.8)
+
+
+plt.title('Actual vs Predicted Tomato Demand (First 100 Days of Test Set)')
+plt.xlabel('Days')
+plt.ylabel('Quantity Sold (kg)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+# plt.show()
+
+
+# Save the best model and scaler for potential future deployment
+import os
+import joblib
+
+os.makedirs('models', exist_ok=True)
+best_model = attention_model if results_df.loc["4. LSTM + Attention", "MAE (kg)"] < results_df.loc["3. Standard LSTM", "MAE (kg)"] else lstm_model
+best_model.save('models/best_lstm_attention_model.keras')
+joblib.dump(scaler, 'models/demand_scaler.pkl')
+
+print("Best model and scaler saved successfully to 'models/' directory.")
+

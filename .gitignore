@@ -1,0 +1,27 @@
+# Virtual Environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model files (optional if very large)
+models/
+*.keras
+*.h5
+*.joblib
+
+# macOS
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Logs and Temp
+*.log
+logs/
+*.tmp
